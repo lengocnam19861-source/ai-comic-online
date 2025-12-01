@@ -28,7 +28,6 @@ def extract_clean_json(text: str) -> str:
     if not text:
         return ""
 
-    # Bỏ code block markdown nếu có
     cleaned = (
         text.replace("```json", "")
         .replace("```JSON", "")
@@ -36,7 +35,6 @@ def extract_clean_json(text: str) -> str:
         .strip()
     )
 
-    # Cắt từ dấu { đầu tiên tới dấu } cuối cùng
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -60,24 +58,20 @@ def render_comic_from_json(json_text: str):
         st.code(cleaned, language="json")
         return
 
-    # Hiện lại JSON đẹp đẽ
-    st.subheader("📜 Kịch bản JSON (đã dùng để vẽ)")
+    st.subheader("📜 Kịch bản JSON đã dùng:")
     st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
 
     pages = data.get("pages", [])
     if not pages:
-        st.warning("JSON không có trường 'pages'. Kiểm tra lại cấu trúc bro.")
+        st.warning("JSON không có trường 'pages'.")
         return
 
     st.subheader("🖼️ Kết quả vẽ truyện")
-
-    final_images = []
 
     for page in pages:
         page_index = page.get("page_index", 0)
         st.markdown(f"## 📄 Trang {page_index}")
         cols = st.columns(2)
-        page_imgs = []
 
         for panel in page.get("panels", []):
             panel_index = panel.get("panel_index", 0)
@@ -86,14 +80,14 @@ def render_comic_from_json(json_text: str):
             prompt_img = panel.get("prompt_image", "")
 
             if not prompt_img:
-                st.warning(f"Trang {page_index} – Panel {panel_index} thiếu 'prompt_image', bỏ qua.")
+                st.warning(f"Panel {panel_index} thiếu prompt_image, bỏ qua.")
                 continue
 
-            with st.spinner(f"Đang vẽ Trang {page_index} – Panel {panel_index}…"):
+            with st.spinner(f"Đang vẽ Panel {panel_index}…"):
                 try:
                     img_res = client.images.generate(
-                        model="gpt-image-1",
-                        prompt=f"Manga black & white, {prompt_img}",
+                        model="gpt-image-1-mini",   # <<<<< MODEL KHÔNG CẦN VERIFY
+                        prompt=f"Manga black & white, detailed line art, {prompt_img}",
                         size="1024x1024",
                         n=1,
                     )
@@ -101,19 +95,15 @@ def render_comic_from_json(json_text: str):
                     img_bytes = base64.b64decode(img_b64)
                     img = Image.open(BytesIO(img_bytes))
                 except Exception as e:
-                    st.error(f"Lỗi khi vẽ ảnh (Trang {page_index}, Panel {panel_index}): {e}")
+                    st.error(f"Lỗi khi vẽ ảnh (Panel {panel_index}): {e}")
                     continue
 
-            col = cols[(panel_index - 1) % 2]
-            col.image(img, caption=f"Trang {page_index} – Panel {panel_index}")
+            c = cols[(panel_index - 1) % 2]
+            c.image(img, caption=f"Trang {page_index} – Panel {panel_index}")
             if desc:
-                col.write(f"📝 {desc}")
+                c.write(f"📝 {desc}")
             if dialogue:
-                col.write("💬 " + " / ".join(dialogue))
-
-            page_imgs.append(img)
-
-        final_images.append(page_imgs)
+                c.write("💬 " + " / ".join(dialogue))
 
     st.success("🎉 Vẽ xong truyện rồi bro!")
 
@@ -138,10 +128,10 @@ with st.sidebar:
 
 st.markdown("---")
 
-# ================== MODE 1: TẠO KỊCH BẢN TỪ Ý TƯỞNG ==================
+# ================== TẠO KỊCH BẢN ==================
 if mode == "Tạo kịch bản từ ý tưởng":
     idea = st.text_area(
-        "💡 Nhập ý tưởng truyện (có thể mô tả từng cảnh, lời thoại…):",
+        "💡 Nhập ý tưởng truyện:",
         height=150,
     )
 
@@ -151,19 +141,13 @@ if mode == "Tạo kịch bản từ ý tưởng":
         else:
             prompt = f"""
 Bạn là AI chuyên tạo JSON truyện tranh.
+TRẢ VỀ JSON THUẦN — KHÔNG GIẢI THÍCH.
 
-QUY ĐỊNH RẤT QUAN TRỌNG:
-- Chỉ trả về JSON THUẦN, KHÔNG dùng ```json hoặc bất kỳ markdown nào.
-- KHÔNG viết thêm câu giải thích.
-- KHÔNG có chữ nào nằm ngoài JSON.
-- JSON phải parse được bằng json.loads trong Python.
-
-Hãy tạo truyện tranh phong cách: {style}
+Phong cách: {style}
 Số trang: {pages}
-Ý tưởng truyện (tiếng Việt): {idea}
+Ý tưởng: {idea}
 
-Cấu trúc JSON bắt buộc:
-
+Cấu trúc JSON mẫu:
 {{
   "title": "Tên truyện",
   "pages": [
@@ -172,62 +156,56 @@ Cấu trúc JSON bắt buộc:
       "panels": [
         {{
           "panel_index": 1,
-          "description": "Mô tả cảnh vẽ chi tiết (nhân vật, bối cảnh, cảm xúc, góc máy…)",
+          "description": "Mô tả cảnh tiếng Việt",
           "dialogue": ["Thoại 1", "Thoại 2"],
-          "prompt_image": "Mô tả tiếng Anh ngắn gọn để AI vẽ, phong cách manga black & white"
+          "prompt_image": "Mô tả vẽ bằng tiếng Anh"
         }}
       ]
     }}
   ]
 }}
 
-YÊU CẦU:
-- Mỗi trang 2–4 panel.
-- dialogue viết tiếng Việt, ngắn, tự nhiên.
-- prompt_image viết tiếng Anh, mô tả rõ cảnh + mood + góc máy.
-Trả về NGAY JSON theo đúng cấu trúc trên.
+Trả đúng JSON trên, không thêm chữ khác.
 """
 
             with st.spinner("⏳ Đang tạo kịch bản…"):
                 resp = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.4,
+                    temperature=0.3,
                 )
 
             raw = resp.choices[0].message.content
             cleaned = extract_clean_json(raw)
 
             try:
-                json.loads(cleaned)  # kiểm tra hợp lệ
+                json.loads(cleaned)
                 st.session_state.json_text = cleaned
                 st.success("✅ Tạo kịch bản xong! Kéo xuống để chỉnh sửa hoặc vẽ.")
             except Exception as e:
-                st.error(f"❌ JSON lỗi (chi tiết: {e})")
-                st.subheader("Nội dung GPT trả về (để debug):")
-                st.code(raw, language="text")
+                st.error(f"❌ JSON lỗi: {e}")
+                st.code(raw)
 
-# ================== MODE 2: VẼ LẠI TỪ JSON ==================
+# ================== SỬA JSON ==================
 st.markdown("---")
 
 if mode == "Vẽ lại từ JSON đã chỉnh sửa":
-    st.info("Dán JSON kịch bản vào dưới đây, chỉnh sửa thoại / mô tả / panel xong rồi bấm vẽ.")
+    st.info("Dán JSON vào đây để vẽ lại.")
     st.session_state.json_text = st.text_area(
         "JSON kịch bản:",
         value=st.session_state.json_text,
         height=400,
     )
 else:
-    # Đang ở mode tạo script, nếu đã có JSON thì cho sửa luôn
     if st.session_state.json_text:
-        st.subheader("✏️ JSON kịch bản (bro có thể sửa rồi vẽ)")
+        st.subheader("✏️ JSON kịch bản (có thể sửa):")
         st.session_state.json_text = st.text_area(
-            "Chỉnh sửa JSON tại đây:",
+            "Sửa JSON tại đây:",
             value=st.session_state.json_text,
             height=400,
         )
 
-# Nút vẽ (dùng chung cho cả 2 mode, miễn là có JSON)
+# ================== NÚT VẼ ==================
 if st.session_state.json_text:
     if st.button("🎨 VẼ TRUYỆN TỪ JSON Ở TRÊN"):
         render_comic_from_json(st.session_state.json_text)
