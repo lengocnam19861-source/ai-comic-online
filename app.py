@@ -1,30 +1,54 @@
 import json
+import os
+import io
+import zipfile
+from collections import defaultdict
 
 import streamlit as st
 from openai import OpenAI
+from PIL import Image
+
+from google import genai
+from google.genai import types
 
 # ================== CẤU HÌNH APP ==================
 st.set_page_config(
-    page_title="AI Comic Prompt Studio",
+    page_title="AI Comic Pipeline PRO",
     layout="wide"
 )
-st.title("📚 AI Comic Prompt Studio – Viết truyện & xuất prompt cho Gemini Canvas")
+st.title("📚 AI Comic Pipeline PRO – Kịch bản ➜ Ảnh Gemini ➜ ZIP tải về")
+
+st.caption(
+    "Flow: Dán ý tưởng/kịch bản ➜ AI tạo JSON truyện ➜ Gọi Gemini sinh ảnh từng panel ➜ "
+    "Tự lưu và gom lại theo trang/panel cho bro tải về."
+)
 
 # ================== API KEY ==================
+# OPENAI dùng để tạo JSON kịch bản
 if "OPENAI_API_KEY" not in st.secrets:
     st.error(
-        "❌ Chưa có OPENAI_API_KEY trong Secrets.\n"
-        "Vào Manage app → Settings → Secrets và thêm:\n\n"
+        "❌ Thiếu OPENAI_API_KEY trong Secrets.\n"
+        "Vào Manage app → Settings → Secrets và thêm:\n"
         "OPENAI_API_KEY = \"sk-...\""
     )
     st.stop()
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+# GEMINI (Imagen) dùng để tạo ảnh
+if "GEMINI_API_KEY" not in st.secrets:
+    st.warning(
+        "⚠ Chưa có GEMINI_API_KEY trong Secrets.\n"
+        "Nếu bro dùng Gemini / Imagen thì vào Secrets thêm:\n"
+        "GEMINI_API_KEY = \"<YOUR_GEMINI_API_KEY>\""
+    )
+    gemini_client = None
+else:
+    gemini_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 # ================== SESSION STATE ==================
 if "script_json" not in st.session_state:
     st.session_state.script_json = ""
-
 
 # ================== HÀM PHỤ ==================
 def extract_clean_json(text: str) -> str:
@@ -47,197 +71,14 @@ def extract_clean_json(text: str) -> str:
     return cleaned.strip()
 
 
-def build_page_prompts_no_text(data: dict, art_style: str) -> str:
-    """Prompt-level: từng TRANG, KHÔNG CHỮ (chỉ tranh + bóng thoại trống)."""
-    title = data.get("title", "Untitled Comic")
-    pages = data.get("pages", [])
-
-    lines = []
-    lines.append(
-        f"GLOBAL INSTRUCTIONS:\n"
-        f"- Create comic pages for a story titled '{title}'.\n"
-        f"- Overall art style: {art_style}.\n"
-        f"- Clean lineart, high detail, vibrant but soft colors.\n"
-        f"- IMPORTANT: Do NOT draw any legible text, letters or numbers.\n"
-        f"- You may draw speech bubbles, but keep them completely BLANK.\n"
-        f"- No sound effects text (no 'BOOM', 'CLACK', etc.).\n"
-        f"- No watermarks.\n"
-        f"- High resolution, suitable for printing or HD screens.\n"
+def generate_script_with_openai(idea: str, art_style: str, pages: int, panels: int) -> str:
+    """Gọi OpenAI tạo JSON kịch bản truyện."""
+    sys_prompt = (
+        "You are a professional comic script writer. "
+        "Your job is to output ONLY valid JSON (no markdown) for a comic script."
     )
 
-    for page in pages:
-        page_idx = page.get("page_index", 1)
-        panels = page.get("panels", [])
-        lines.append("")
-        lines.append("=" * 60)
-        lines.append(f"PAGE {page_idx} – COMIC LAYOUT PROMPT")
-        lines.append(
-            f"Create ONE comic page with {len(panels)} panels "
-            f"in {art_style} style. Keep empty speech bubbles or empty areas for text."
-        )
-
-        for panel in panels:
-            idx = panel.get("panel_index", 1)
-            desc = panel.get("description", "")
-            base_prompt = panel.get("prompt_image", "")
-            lines.append("")
-            lines.append(f"Panel {idx}:")
-            if desc:
-                lines.append(f"- Scene description (Vietnamese): {desc}")
-            if base_prompt:
-                lines.append(f"- Extra visual prompt (English): {base_prompt}")
-
-        lines.append("")
-        lines.append(
-            "Camera: use varied cinematic angles (wide shot, medium, close-up) "
-            "to make the page dynamic."
-        )
-
-    return "\n".join(lines)
-
-
-def build_page_prompts_with_text(data: dict, art_style: str) -> str:
-    """Prompt-level: từng TRANG, CÓ CHỮ TIẾNG VIỆT (cẩn thận font)."""
-    title = data.get("title", "Untitled Comic")
-    pages = data.get("pages", [])
-
-    lines = []
-    lines.append("GLOBAL INSTRUCTIONS FOR VIETNAMESE TEXT:")
-    lines.append(
-        "- Render all speech bubble text using a Vietnamese-safe font such as:\n"
-        "  • Noto Sans\n"
-        "  • Be Vietnam Pro\n"
-        "  • Roboto\n"
-    )
-    lines.append(
-        "- Do NOT change, normalize or remove diacritics in Vietnamese.\n"
-        "- Keep all characters EXACTLY as written, including: "
-        "ă â ê ô ơ ư đ Á Ắ Ứ ệ ố ờ ẵ ỹ.\n"
-    )
-    lines.append(
-        "- If the system does not support these fonts by name, choose the closest "
-        "modern sans-serif font that fully supports Vietnamese Unicode."
-    )
-    lines.append(
-        f"- Art style: {art_style}. Clean lines, high detail, story-driven composition.\n"
-    )
-
-    for page in pages:
-        page_idx = page.get("page_index", 1)
-        panels = page.get("panels", [])
-        lines.append("")
-        lines.append("=" * 60)
-        lines.append(f"PAGE {page_idx} – WITH VIETNAMESE DIALOGUE")
-
-        for panel in panels:
-            idx = panel.get("panel_index", 1)
-            desc = panel.get("description", "")
-            base_prompt = panel.get("prompt_image", "")
-            dialogue = panel.get("dialogue", [])
-
-            lines.append("")
-            lines.append(f"Panel {idx}:")
-            if desc:
-                lines.append(f"- Scene description: {desc}")
-            if base_prompt:
-                lines.append(f"- Visual style prompt (English): {base_prompt}")
-            if dialogue:
-                lines.append("- Dialogue to show in speech bubbles (Vietnamese):")
-                for d in dialogue:
-                    lines.append(f"  • {d}")
-
-    return "\n".join(lines)
-
-
-def build_panel_prompt_list(data: dict, art_style: str) -> str:
-    """Danh sách prompt cho TỪNG PANEL (vẽ lẻ từng cảnh)."""
-    title = data.get("title", "Untitled Comic")
-    pages = data.get("pages", [])
-
-    lines = []
-    lines.append(
-        f"Single-panel prompts for the comic '{title}'. "
-        f"Art style: {art_style}. High-res, detailed, no text unless explicitly mentioned."
-    )
-    lines.append("-" * 60)
-
-    for page in pages:
-        page_idx = page.get("page_index", 1)
-        panels = page.get("panels", [])
-        for panel in panels:
-            idx = panel.get("panel_index", 1)
-            desc = panel.get("description", "")
-            base_prompt = panel.get("prompt_image", "")
-            dialogue = panel.get("dialogue", [])
-
-            lines.append("")
-            lines.append(f"PAGE {page_idx} – PANEL {idx}")
-            final_prompt = f"{art_style}, highly detailed illustration."
-
-            if base_prompt:
-                final_prompt += f" {base_prompt}"
-            if desc:
-                final_prompt += f" | Scene hint (VN): {desc}"
-
-            lines.append(f"Image prompt: {final_prompt}")
-
-            if dialogue:
-                lines.append("Dialogue (Vietnamese, for reference only):")
-                for d in dialogue:
-                    lines.append(f"- {d}")
-
-            lines.append("-" * 40)
-
-    return "\n".join(lines)
-
-
-# ================== SIDEBAR ==================
-with st.sidebar:
-    st.header("⚙️ Chế độ làm việc")
-
-    mode = st.radio(
-        "Chọn chế độ:",
-        ["Tạo kịch bản mới từ ý tưởng", "Dán / chỉnh JSON có sẵn"],
-    )
-
-    art_style = st.selectbox(
-        "Phong cách tranh:",
-        [
-            "Manga trinh thám đen trắng",
-            "Anime trẻ em nhiều màu",
-            "Phong cách Ghibli mềm mại",
-            "Comic phương Tây màu sắc",
-            "Chibi dễ thương",
-        ],
-    )
-
-    default_pages = st.slider("Số trang mong muốn (khi tạo mới):", 1, 6, 1)
-    default_panels = st.slider("Số panel / trang (ước lượng):", 1, 8, 4)
-
-
-st.markdown("---")
-
-# ================== MODE 1: TẠO KỊCH BẢN MỚI ==================
-if mode == "Tạo kịch bản mới từ ý tưởng":
-    st.subheader("🧠 Nhập ý tưởng truyện")
-
-    idea = st.text_area(
-        "Bro mô tả ý tưởng (cốt truyện, nhân vật, từng cảnh… càng chi tiết càng tốt):",
-        height=160,
-        placeholder="Ví dụ: Một chú mèo tò mò khám phá căn nhà cũ, phát hiện ra cánh cửa bí mật...",
-    )
-
-    if st.button("🚀 Tạo kịch bản JSON"):
-        if not idea.strip():
-            st.warning("Nhập ý tưởng đã rồi mình mới chiến chứ bro 😅")
-        else:
-            sys_prompt = (
-                "You are a professional comic script writer. "
-                "Your job is to output ONLY valid JSON (no markdown) "
-                "for a comic book script."
-            )
-
-            user_prompt = f"""
+    user_prompt = f"""
 Hãy tạo kịch bản truyện tranh ở dạng JSON.
 
 YÊU CẦU QUAN TRỌNG:
@@ -246,8 +87,8 @@ YÊU CẦU QUAN TRỌNG:
 - JSON phải parse được bằng json.loads trong Python.
 
 Phong cách tranh: {art_style}
-Số trang mong muốn: {default_pages}
-Số panel ước lượng trên mỗi trang: {default_panels}
+Số trang mong muốn: {pages}
+Số panel ước lượng trên mỗi trang: {panels}
 
 Nội dung (tiếng Việt):
 {idea}
@@ -277,114 +118,273 @@ Quy tắc:
 - prompt_image viết tiếng Anh, có thể thêm thông tin: shot type (wide shot, close-up), lighting, mood, background.
 """
 
-            with st.spinner("⏳ Đang nhờ AI viết kịch bản cho bro…"):
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.4,
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.4,
+    )
+
+    raw = resp.choices[0].message.content
+    cleaned = extract_clean_json(raw)
+    # Confirm JSON hợp lệ
+    json.loads(cleaned)
+    return cleaned
+
+
+def generate_panel_image_with_gemini(prompt: str, aspect_ratio: str = "3:4") -> Image.Image:
+    """
+    Gọi Gemini/Imagen tạo ảnh từ prompt.
+    Dùng SDK google-genai (client.models.generate_images).
+    Lưu ý: bro cần enable Imagen 3 / Gemini Image trong project Google Cloud.
+    """
+    if gemini_client is None:
+        raise RuntimeError("Chưa cấu hình GEMINI_API_KEY trong Streamlit secrets.")
+
+    # Tham khảo docs: generate_images với Imagen 3
+    # model 'imagen-3.0-generate-002' có thể thay đổi tùy project.
+    response = gemini_client.models.generate_images(
+        model="imagen-3.0-generate-002",
+        prompt=prompt,
+        config=types.GenerateImagesConfig(
+            number_of_images=1,
+            aspect_ratio=aspect_ratio,
+        ),
+    )
+
+    # response.generated_images[0].image là đối tượng PIL.Image (theo docs SDK)
+    img = response.generated_images[0].image
+    return img
+
+
+def build_panel_prompt(art_style: str, desc: str, prompt_img: str) -> str:
+    """
+    Ghép description tiếng Việt + prompt_image tiếng Anh thành prompt final cho Gemini.
+    """
+    base = f"""
+{art_style}, comic panel illustration.
+
+Scene (Vietnamese): {desc}
+
+Image style (English): {prompt_img}
+
+IMPORTANT:
+- Do NOT draw any text, letters, or numbers.
+- Do NOT draw speech bubble text.
+- Có thể vẽ bóng thoại nhưng để trống bên trong, hoặc chừa khoảng trống để sau này thêm chữ.
+- Clean line art, high detail, consistent characters, story-driven composition.
+"""
+    return base.strip()
+
+
+def generate_all_images_from_json(
+    data: dict,
+    art_style: str,
+    aspect_ratio: str = "3:4",
+) -> tuple[list[dict], bytes]:
+    """
+    Vẽ TẤT CẢ panels theo JSON data bằng Gemini.
+    Trả về:
+    - danh sách {page_index, panel_index, filename, image_bytes}
+    - zip_bytes: file zip chứa toàn bộ ảnh.
+    """
+
+    pages = data.get("pages", [])
+    results = []
+
+    # Dùng buffer zip trong RAM, không cần ghi file thật ra disk
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for page in pages:
+            page_idx = page.get("page_index", 1)
+            for panel in page.get("panels", []):
+                panel_idx = panel.get("panel_index", 1)
+                desc = panel.get("description", "")
+                prompt_img = panel.get("prompt_image", "")
+
+                final_prompt = build_panel_prompt(art_style, desc, prompt_img)
+                filename = f"page{page_idx:02d}_panel{panel_idx:02d}.png"
+
+                try:
+                    img = generate_panel_image_with_gemini(final_prompt, aspect_ratio=aspect_ratio)
+                except Exception as e:
+                    # Nếu lỗi tạo ảnh, lưu log nhưng vẫn cho app chạy tiếp
+                    results.append(
+                        {
+                            "page_index": page_idx,
+                            "panel_index": panel_idx,
+                            "filename": filename,
+                            "error": str(e),
+                            "image_bytes": None,
+                        }
+                    )
+                    continue
+
+                # Lưu ảnh vào bytes
+                img_bytes_io = io.BytesIO()
+                img.save(img_bytes_io, format="PNG")
+                img_bytes = img_bytes_io.getvalue()
+
+                # Ghi vào zip
+                zf.writestr(filename, img_bytes)
+
+                results.append(
+                    {
+                        "page_index": page_idx,
+                            "panel_index": panel_idx,
+                            "filename": filename,
+                            "error": None,
+                            "image_bytes": img_bytes,
+                    }
                 )
 
-            raw = resp.choices[0].message.content
-            cleaned = extract_clean_json(raw)
+    zip_buffer.seek(0)
+    zip_bytes = zip_buffer.getvalue()
+    return results, zip_bytes
 
-            try:
-                json.loads(cleaned)  # kiểm tra hợp lệ
-                st.session_state.script_json = cleaned
-                st.success("✅ Đã tạo xong kịch bản JSON! Kéo xuống để chỉnh sửa & xuất prompt.")
-            except Exception as e:
-                st.error(f"❌ JSON lỗi, không parse được: {e}")
-                st.subheader("Nội dung AI trả về (để bro tự chỉnh tay nếu cần):")
-                st.code(raw, language="text")
 
-# ================== MODE 2: DÁN / CHỈNH JSON ==================
-if mode == "Dán / chỉnh JSON có sẵn" and not st.session_state.script_json:
-    st.info("Bro có thể dán JSON kịch bản vào ô dưới (khi chưa có kịch bản nào).")
+# ================== SIDEBAR ==================
+with st.sidebar:
+    st.header("⚙️ Cài đặt")
+
+    mode = st.radio(
+        "Chế độ:",
+        ["Tạo kịch bản mới từ ý tưởng", "Dán/Chỉnh JSON có sẵn"],
+    )
+
+    art_style = st.selectbox(
+        "Phong cách tranh:",
+        [
+            "Manga trinh thám đen trắng",
+            "Anime trẻ em nhiều màu",
+            "Phong cách Ghibli mềm mại",
+            "Comic phương Tây màu sắc",
+            "Chibi dễ thương",
+        ],
+    )
+
+    default_pages = st.slider("Số trang mong muốn (OpenAI dùng để gợi ý):", 1, 10, 1)
+    default_panels = st.slider("Số panel / trang (ước lượng):", 1, 8, 4)
+
+    aspect_ratio = st.selectbox(
+        "Tỉ lệ ảnh Gemini:",
+        ["1:1", "3:4", "4:3", "9:16", "16:9"],
+        index=1,
+    )
 
 st.markdown("---")
 
-# ================== KHU VỰC CHỈNH JSON ==================
-st.subheader("✏️ JSON kịch bản (có thể sửa trực tiếp)")
-st.caption("Khi sửa xong, tất cả prompt xuất ra bên dưới sẽ dùng bản JSON này.")
+# ================== MODE 1: TẠO KỊCH BẢN MỚI ==================
+if mode == "Tạo kịch bản mới từ ý tưởng":
+    st.subheader("🧠 Nhập ý tưởng / kịch bản thô")
+
+    idea = st.text_area(
+        "Bro mô tả cốt truyện, nhân vật, từng cảnh… (tiếng Việt):",
+        height=160,
+        placeholder="Ví dụ: Một chú mèo đen tò mò khám phá căn nhà cổ, phát hiện cánh cửa bí mật, mở ra và tìm thấy một bức ảnh gia đình...",
+    )
+
+    if st.button("🚀 Tạo JSON kịch bản bằng OpenAI"):
+        if not idea.strip():
+            st.warning("Nhập ý tưởng đã rồi mình mới chiến tiếp được bro 😅")
+        else:
+            try:
+                with st.spinner("⏳ Đang nhờ OpenAI viết kịch bản JSON…"):
+                    script = generate_script_with_openai(
+                        idea=idea,
+                        art_style=art_style,
+                        pages=default_pages,
+                        panels=default_panels,
+                    )
+                st.session_state.script_json = script
+                st.success("✅ Đã tạo xong JSON kịch bản! Kéo xuống để chỉnh/sử dụng.")
+            except Exception as e:
+                st.error(f"❌ Lỗi khi tạo JSON: {e}")
+
+# ================== CHỈNH JSON ==================
+st.markdown("---")
+st.subheader("✏️ JSON kịch bản (bro có thể sửa trực tiếp)")
+st.caption("Mọi thao tác vẽ ảnh sẽ dùng JSON ở ô này.")
 
 st.session_state.script_json = st.text_area(
     "Dán hoặc chỉnh JSON tại đây:",
     value=st.session_state.script_json,
-    height=340,
+    height=320,
     placeholder='{"title": "...", "pages": [...]}',
 )
 
-# Kiểm tra JSON
-valid_data = None
-if st.session_state.script_json.strip():
-    try:
-        valid_data = json.loads(extract_clean_json(st.session_state.script_json))
-        st.success("✅ JSON hợp lệ.")
-    except Exception as e:
-        st.error(f"❌ JSON hiện tại bị lỗi: {e}")
-        st.stop()
-else:
-    st.info("Chưa có JSON để làm prompt bro.")
+# Parse JSON
+if not st.session_state.script_json.strip():
+    st.info("Chưa có JSON. Bro hãy tạo bằng OpenAI hoặc dán JSON có sẵn vào.")
     st.stop()
 
-# ================== XUẤT PROMPT CHO GEMINI CANVAS ==================
+try:
+    data = json.loads(extract_clean_json(st.session_state.script_json))
+    st.success("✅ JSON hợp lệ.")
+except Exception as e:
+    st.error(f"❌ JSON hiện tại bị lỗi: {e}")
+    st.stop()
+
+title = data.get("title", "Untitled Comic")
+st.write(f"📖 **Tiêu đề truyện:** {title}")
+
+# ================== VẼ ẢNH VỚI GEMINI ==================
 st.markdown("---")
-st.subheader("🎨 Bộ Prompt PRO cho Gemini Canvas / Canva / DALL·E …")
+st.subheader("🎨 Bước 2 – Gọi Gemini vẽ TẤT CẢ panels và gom vào ZIP")
 
-# 1) Prompt trang – không chữ
-no_text_prompts = build_page_prompts_no_text(valid_data, art_style)
-st.markdown("#### 1️⃣ Prompt vẽ TRANG – KHÔNG CHỮ (chỉ tranh + bóng thoại trống)")
-st.caption("Dùng khi bro muốn tự thêm chữ trong Canva / Canvas.")
-st.text_area(
-    "Copy prompt này để dán vào Gemini Canvas (có thể chỉnh thêm nếu muốn):",
-    value=no_text_prompts,
-    height=260,
-)
-st.download_button(
-    "📥 Tải file prompt_trang_khong_chu.txt",
-    data=no_text_prompts.encode("utf-8"),
-    file_name="prompt_trang_khong_chu.txt",
-    mime="text/plain",
-)
+if gemini_client is None:
+    st.error(
+        "❌ Chưa cấu hình GEMINI_API_KEY nên không gọi Gemini vẽ ảnh được.\n"
+        "Nếu bro muốn full pipeline, vào Secrets thêm GEMINI_API_KEY trước."
+    )
+else:
+    if st.button("🖼️ VẼ TẤT CẢ PANEL BẰNG GEMINI & TẠO ZIP"):
+        with st.spinner("⏳ Đang gọi Gemini vẽ từng panel… tuỳ số lượng nên có thể hơi lâu một chút."):
+            try:
+                results, zip_bytes = generate_all_images_from_json(
+                    data,
+                    art_style=art_style,
+                    aspect_ratio=aspect_ratio,
+                )
+            except Exception as e:
+                st.error(f"❌ Lỗi khi gọi Gemini tạo ảnh: {e}")
+            else:
+                st.success(f"✅ Đã xử lý xong {len(results)} panel.")
 
-st.markdown("---")
+                # Hiển thị vài ảnh minh hoạ
+                st.markdown("### 👀 Xem thử một vài panel đã vẽ:")
 
-# 2) Prompt trang – có chữ tiếng Việt
-with_text_prompts = build_page_prompts_with_text(valid_data, art_style)
-st.markdown("#### 2️⃣ Prompt vẽ TRANG CÓ CHỮ TIẾNG VIỆT (font an toàn)")
-st.caption(
-    "Dùng khi bro muốn Gemini vẽ luôn chữ tiếng Việt (đã kèm hướng dẫn dùng font Noto Sans / Be Vietnam Pro / Roboto)."
-)
-st.text_area(
-    "Prompt có chữ TV (có thể hơi dài, bro copy phần cần thiết):",
-    value=with_text_prompts,
-    height=280,
-)
-st.download_button(
-    "📥 Tải file prompt_trang_co_chu_viet.txt",
-    data=with_text_prompts.encode("utf-8"),
-    file_name="prompt_trang_co_chu_viet.txt",
-    mime="text/plain",
-)
+                show_count = 0
+                for item in results:
+                    if item["image_bytes"] is None:
+                        st.warning(
+                            f"Trang {item['page_index']} – Panel {item['panel_index']} lỗi: {item['error']}"
+                        )
+                        continue
+                    img = Image.open(io.BytesIO(item["image_bytes"]))
+                    st.image(
+                        img,
+                        caption=f"Trang {item['page_index']} – Panel {item['panel_index']} ({item['filename']})",
+                        use_column_width=True,
+                    )
+                    show_count += 1
+                    if show_count >= 4:
+                        break
 
-st.markdown("---")
+                # Nút tải ZIP
+                st.markdown("### 📦 Tải toàn bộ ảnh (đã đánh số trang/panel)")
+                st.download_button(
+                    "📥 Tải file comic_panels.zip",
+                    data=zip_bytes,
+                    file_name="comic_panels.zip",
+                    mime="application/zip",
+                )
 
-# 3) Prompt từng panel
-panel_prompts = build_panel_prompt_list(valid_data, art_style)
-st.markdown("#### 3️⃣ Prompt TỪNG PANEL (vẽ lẻ từng cảnh)")
-st.caption("Dùng nếu bro muốn vẽ từng cảnh riêng rồi tự sắp vào layout.")
-st.text_area(
-    "Danh sách prompt cho từng panel:",
-    value=panel_prompts,
-    height=260,
-)
-st.download_button(
-    "📥 Tải file prompt_tung_panel.txt",
-    data=panel_prompts.encode("utf-8"),
-    file_name="prompt_tung_panel.txt",
-    mime="text/plain",
-)
+                st.info(
+                    "Trong ZIP, mỗi file được đặt tên dạng:\n"
+                    "`page01_panel01.png`, `page01_panel02.png`, …\n"
+                    "Bro có thể import thẳng vào Canva / Premiere / CapCut / v.v. để làm video hoặc bố cục lại."
+                )
 
-st.success("🔥 Xong! Bro chỉ việc copy hoặc tải file prompt và dán qua Gemini Canvas thôi.")
